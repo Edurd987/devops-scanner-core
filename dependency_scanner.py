@@ -3,16 +3,27 @@
 
 import argparse
 import json
+import logging
 import os
 import re
 import sys
 import urllib.request
 import urllib.error
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Optional
+
+try:
+    import tomllib
+except ImportError:
+    try:
+        import tomli as tomllib
+    except ImportError:
+        tomllib = None
+
+logger = logging.getLogger(__name__)
 
 
 class Severity(Enum):
@@ -63,6 +74,35 @@ class Dependency:
     risk_score: int = 0
     recommendations: list[str] = field(default_factory=list)
 
+    def to_dict(self) -> dict:
+        return {
+            "name": self.name,
+            "version": self.version,
+            "source_file": self.source_file,
+            "ecosystem": self.ecosystem,
+            "line_number": self.line_number,
+            "pinned": self.pinned,
+            "severity": self.severity.value.lower() if self.severity else None,
+            "note": self.note,
+            "license": {
+                "name": self.license.name,
+                "spdx_id": self.license.spdx_id,
+                "is_copyleft": self.license.is_copyleft,
+                "is_permissive": self.license.is_permissive,
+                "osi_approved": self.license.osi_approved,
+                "note": self.license.note,
+            } if self.license else None,
+            "is_critical_domain": self.is_critical_domain,
+            "is_stale": self.is_stale,
+            "is_shadow": self.is_shadow,
+            "is_outdated": self.is_outdated,
+            "latest_version": self.latest_version,
+            "cve_count": self.cve_count,
+            "cve_ids": self.cve_ids,
+            "risk_score": self.risk_score,
+            "recommendations": self.recommendations,
+        }
+
 
 @dataclass
 class RiskSummary:
@@ -73,6 +113,7 @@ class RiskSummary:
     maintenance_score: int = 0
     shadow_count: int = 0
     stale_count: int = 0
+    vulnerable_count: int = 0
     critical_domain_count: int = 0
     copyleft_count: int = 0
     total_dependencies: int = 0
@@ -217,8 +258,13 @@ def parse_requirements(path: Path) -> list[Dependency]:
 def parse_package_json(path: Path) -> list[Dependency]:
     deps = []
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+        raw = path.read_text(encoding="utf-8-sig")
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning(f"Failed to parse {path}: {e}")
+        return deps
+    except Exception as e:
+        logger.warning(f"Failed to read {path}: {e}")
         return deps
 
     sections = {"dependencies": "npm", "devDependencies": "npm"}
@@ -227,13 +273,18 @@ def parse_package_json(path: Path) -> list[Dependency]:
             deps.append(Dependency(
                 name=name, version=ver,
                 source_file=str(path), ecosystem=eco,
-                pinned=ver.startswith("^") or ver.startswith("~"),
+                pinned=not ver.startswith("^") and not ver.startswith("~"),
             ))
 
+    logger.info(f"Parsed {path}: {len(deps)} dependencies")
     return deps
 
 
 def parse_pom_xml(path: Path) -> list[Dependency]:
+    # EXPERIMENTAL: parser produces unreliable data (see ROADMAP).
+    # Disabled to avoid feeding wrong names/versions into OSV queries.
+    print("[experimental] Maven (pom.xml) parser is experimental and disabled - results would be inaccurate")
+    return []
     deps = []
     try:
         content = path.read_text(encoding="utf-8")
@@ -315,6 +366,10 @@ def parse_gemfile_lock(path: Path) -> list[Dependency]:
 
 
 def parse_cargo_toml(path: Path) -> list[Dependency]:
+    # EXPERIMENTAL: parser produces unreliable data (see ROADMAP).
+    # Disabled to avoid feeding wrong names/versions into OSV queries.
+    print("[experimental] Cargo (Cargo.toml) parser is experimental and disabled - results would be incomplete")
+    return []
     deps = []
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -343,6 +398,52 @@ def parse_cargo_toml(path: Path) -> list[Dependency]:
     return deps
 
 
+def parse_pyproject_toml(path: Path) -> list[Dependency]:
+    deps = []
+    if tomllib is None:
+        return deps
+    try:
+        with open(path, "rb") as f:
+            data = tomllib.load(f)
+    except Exception:
+        return deps
+
+    project = data.get("project", {})
+    dep_sections = [("dependencies", False)]
+    for group_name in project.get("optional-dependencies", {}):
+        dep_sections.append((f"optional-dependencies.{group_name}", True))
+
+    for section_key, is_optional in dep_sections:
+        if section_key == "dependencies":
+            raw_deps = project.get("dependencies", [])
+        else:
+            group = section_key.split(".", 1)[1]
+            raw_deps = project.get("optional-dependencies", {}).get(group, [])
+
+        for i, dep_str in enumerate(raw_deps, 1):
+            if not isinstance(dep_str, str):
+                continue
+            dep_str = dep_str.strip()
+            extras_match = re.match(r'^([A-Za-z0-9_][A-Za-z0-9._-]*)\s*(\[.*?\])?\s*([><=!~].*)?$', dep_str)
+            if extras_match:
+                name = extras_match.group(1).lower()
+                ver = extras_match.group(3) or "unspecified"
+                pinned = ver.startswith("==")
+            else:
+                name = re.split(r'[><=!~\s]', dep_str)[0].lower()
+                ver = "unspecified"
+                pinned = False
+
+            note = "optional dependency" if is_optional else ""
+            deps.append(Dependency(
+                name=name, version=ver,
+                source_file=str(path), ecosystem="python",
+                line_number=i, pinned=pinned, note=note,
+            ))
+
+    return deps
+
+
 # --- Parsers for lock files (shadow dependency detection) ---
 
 def parse_package_lock(path: Path) -> list[Dependency]:
@@ -364,7 +465,7 @@ def parse_package_lock(path: Path) -> list[Dependency]:
             deps.append(Dependency(
                 name=real_name, version=ver,
                 source_file=str(path), ecosystem="npm",
-                is_shadow=True,
+                is_shadow=True, pinned=True,  # lock file = exact/pinned versions
             ))
 
     # npm v1 format
@@ -376,7 +477,7 @@ def parse_package_lock(path: Path) -> list[Dependency]:
                 deps.append(Dependency(
                     name=sub_name, version=sub_info.get("version", ""),
                     source_file=str(path), ecosystem="npm",
-                    is_shadow=True,
+                    is_shadow=True, pinned=True,  # lock file = exact/pinned versions
                 ))
 
     return deps
@@ -408,7 +509,7 @@ KNOWN_VULNERABLE = {
     "lodash": {"critical": ["<4.17.21"]},
     "minimist": {"critical": ["<0.2.4", ">=1.0.0 <1.2.6"]},
     "glob-parent": {"high": ["<5.1.2"]},
-    "axios": {"high": ["<0.21.2"]},
+    "axios": {"high": ["<1.6.0"]},
     "express": {"medium": ["<4.18.2"]},
     "flask": {"medium": ["<2.3.2"]},
     "django": {"high": ["<4.2.4"]},
@@ -447,15 +548,42 @@ def _version_matches_range(version: str, vuln_range: str) -> bool:
     except (ValueError, IndexError):
         return False
 
-    if "<" in vuln_range:
-        op, ref = vuln_range.split("<", 1)
-        try:
-            ref_parts = tuple(int(x) for x in re.split(r'[^\d]+', ref)[:3])
-            return parts < ref_parts
-        except (ValueError, IndexError):
-            return False
+    tokens = re.split(r'\s+', vuln_range.strip())
+    for token in tokens:
+        if "<=" in token:
+            _, ref = token.split("<=", 1)
+            try:
+                ref_parts = tuple(int(x) for x in re.split(r'[^\d]+', ref)[:3])
+                if not (parts <= ref_parts):
+                    return False
+            except (ValueError, IndexError):
+                return False
+        elif "<" in token:
+            _, ref = token.split("<", 1)
+            try:
+                ref_parts = tuple(int(x) for x in re.split(r'[^\d]+', ref)[:3])
+                if not (parts < ref_parts):
+                    return False
+            except (ValueError, IndexError):
+                return False
+        elif ">=" in token:
+            _, ref = token.split(">=", 1)
+            try:
+                ref_parts = tuple(int(x) for x in re.split(r'[^\d]+', ref)[:3])
+                if not (parts >= ref_parts):
+                    return False
+            except (ValueError, IndexError):
+                return False
+        elif ">" in token:
+            _, ref = token.split(">", 1)
+            try:
+                ref_parts = tuple(int(x) for x in re.split(r'[^\d]+', ref)[:3])
+                if not (parts > ref_parts):
+                    return False
+            except (ValueError, IndexError):
+                return False
 
-    return False
+    return True
 
 
 # --- OSV.dev API integration ---
@@ -499,34 +627,49 @@ def query_osv(package: str, version: str, ecosystem: str) -> list[dict]:
 
 
 def enrich_with_osv(deps: list[Dependency], use_osv: bool) -> list[Dependency]:
-    """Enrich dependencies with CVE data from osv.dev."""
+    """Enrich dependencies with CVE data via OSV batch API (deterministic, single request)."""
     if not use_osv:
         return deps
 
-    for dep in deps:
-        vulns = query_osv(dep.name, dep.version, dep.ecosystem)
-        if vulns:
-            dep.cve_count = len(vulns)
-            for v in vulns:
-                vid = v.get("id", "")
-                summary = v.get("summary", "")
-                if vid:
-                    dep.cve_ids.append(vid)
-                # Determine severity from OSV database_specific or severity fields
-                severity_list = v.get("severity", [])
-                for s in severity_list:
-                    score_str = s.get("score", "")
-                    # Try to extract severity from CVSS
-                    m = re.search(r'CVSS:[^/]+/([A-Z]+)', score_str)
-                    if m:
-                        cvss_sev = m.group(1).lower()
-                        sev_map = {"s": Severity.CRITICAL, "h": Severity.HIGH, "m": Severity.MEDIUM, "l": Severity.LOW}
-                        if cvss_sev in sev_map:
-                            if dep.severity is None or SEVERITY_ORDER.index(sev_map[cvss_sev]) > SEVERITY_ORDER.index(dep.severity or Severity.LOW):
-                                dep.severity = sev_map[cvss_sev]
-                if dep.severity is None:
-                    dep.severity = Severity.HIGH
-                dep.note = f"{dep.cve_count} CVE(s): {', '.join(dep.cve_ids[:3])}"
+    # Filter: only deps with valid ecosystem + version; remember their indices
+    queries = []
+    query_map = []
+    for i, dep in enumerate(deps):
+        osv_eco = ECOSYSTEM_MAP.get(dep.ecosystem)
+        clean_version = dep.version.lstrip("=><!~^ ").strip()
+        if osv_eco and clean_version and clean_version != "unspecified":
+            queries.append({
+                "package": {"name": dep.name, "ecosystem": osv_eco},
+                "version": clean_version,
+            })
+            query_map.append(i)
+
+    if not queries:
+        return deps
+
+    # Single batch request. Errors propagate up (no silent "0 CVEs").
+    payload = json.dumps({"queries": queries}).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.osv.dev/v1/querybatch",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as resp:
+        results = json.loads(resp.read().decode("utf-8")).get("results", [])
+
+    # Map results back by position (OSV guarantees order matches input)
+    for qi, res in enumerate(results):
+        if qi >= len(query_map):
+            break
+        dep = deps[query_map[qi]]
+        for v in res.get("vulns", []):
+            vid = v.get("id", "")
+            if vid and vid not in dep.cve_ids:
+                dep.cve_ids.append(vid)
+        dep.cve_count = len(dep.cve_ids)
+        if dep.cve_ids:
+            dep.severity = Severity.HIGH
+            dep.note = f"{dep.cve_count} CVE(s): {', '.join(dep.cve_ids[:3])}"
 
     return deps
 
@@ -609,24 +752,20 @@ def detect_outdated(deps: list[Dependency]) -> list[Dependency]:
 # --- Shadow dependency detection ---
 
 def detect_shadow_dependencies(direct_deps: list[Dependency], lock_deps: list[Dependency]) -> list[Dependency]:
-    """Find transitive deps in lock files not in direct config."""
-    direct_names = {(d.name.lower(), d.source_file) for d in direct_deps}
+    """Return ONLY transitive deps: present in lock files but not in direct config.
 
+    Filters out packages already declared directly, so the caller can safely do
+    direct_deps + shadow_deps without duplicates.
+    """
+    direct_names = {d.name.lower() for d in direct_deps}
+    shadow_deps = []
     for ld in lock_deps:
-        # Check if this lock dep is truly transitive
-        is_direct = False
-        for d in direct_deps:
-            if d.name.lower() == ld.name.lower():
-                is_direct = True
-                break
-
-        if not is_direct:
+        if ld.name.lower() not in direct_names:
             ld.is_shadow = True
             ld.note = "shadow/transitive dependency — not in direct config"
             ld.recommendations.append(f"Audit shadow dependency {ld.name} {ld.version}")
-
-    return lock_deps
-
+            shadow_deps.append(ld)
+    return shadow_deps
 
 # --- Risk scoring ---
 
@@ -654,6 +793,8 @@ def calculate_risk_score(deps: list[Dependency]) -> RiskSummary:
             sec_score += 2
         if d.cve_count > 0:
             sec_score += min(d.cve_count * 5, 15)
+        if d.severity is not None or d.cve_count > 0:
+            summary.vulnerable_count += 1
     summary.security_score = min(sec_score, 40)
 
     # License score (0-20)
@@ -663,31 +804,37 @@ def calculate_risk_score(deps: list[Dependency]) -> RiskSummary:
             lic_score += 10
             summary.copyleft_count += 1
         elif d.license and d.license.name == "Unknown":
-            lic_score += 3
+            # Unknown license = missing data, NOT a risk. Do not inflate score.
+            # Real license enrichment from registry is in ROADMAP (Path A).
+            pass
     summary.license_score = min(lic_score, 20)
 
     # Maintenance score (0-20)
+    # Principle: penalize only verifiable facts, not heuristics/missing data.
     maint_score = 0
     for d in deps:
+        # is_stale is a heuristic (version 0.x) — keep as observation, do NOT penalize
         if d.is_stale:
-            maint_score += 5
             summary.stale_count += 1
+        # is_outdated is set only when a known latest version confirms it's old
         if d.is_outdated:
             maint_score += 3
+        # not pinned = hard fact of unfixed version
         if not d.pinned:
             maint_score += 2
     summary.maintenance_score = min(maint_score, 20)
 
-    # Shadow & domain (0-20)
-    shadow_score = 0
+    # Shadow & domain — INFORMATION ONLY, not an automatic penalty.
+    # Rationale: having many transitive deps or using crypto/auth/network
+    # libraries is normal, not a risk in itself. Real risk = CVEs in them
+    # (already counted in Security). We surface these as observations so the
+    # user can review, but do not inflate the score.
     for d in deps:
         if d.is_shadow:
-            shadow_score += 2
             summary.shadow_count += 1
         if d.is_critical_domain:
-            shadow_score += 3
             summary.critical_domain_count += 1
-    extra_score = min(shadow_score, 20)
+    extra_score = 0
 
     summary.overall_score = min(summary.security_score + summary.license_score +
                                 summary.maintenance_score + extra_score, 100)
@@ -755,6 +902,7 @@ SCANNERS = {
     "go.mod": parse_go_mod,
     "Gemfile.lock": parse_gemfile_lock,
     "Cargo.toml": parse_cargo_toml,
+    "pyproject.toml": parse_pyproject_toml,
 }
 
 LOCK_SCANNERS = {
@@ -764,6 +912,59 @@ LOCK_SCANNERS = {
 }
 
 
+EXTENSION_FALLBACKS = {
+    ".json": (parse_package_json, False),
+    ".txt": (parse_requirements, False),
+    ".toml": (parse_pyproject_toml, False),
+    ".xml": (parse_pom_xml, False),
+    ".lock": (parse_poetry_lock, True),
+    ".yaml": (parse_requirements, False),
+    ".yml": (parse_requirements, False),
+    ".cfg": (parse_requirements, False),
+    ".ini": (parse_requirements, False),
+    ".gradle": (parse_pom_xml, False),
+    ".csproj": (parse_pom_xml, False),
+    ".gemspec": (parse_gemfile_lock, False),
+    ".pipfile": (parse_requirements, False),
+    ".nuspec": (parse_pom_xml, False),
+}
+
+
+def _resolve_scanner(fname: str):
+    if fname in SCANNERS:
+        return SCANNERS[fname], False
+    for scanner_name in SCANNERS:
+        if fname.endswith(scanner_name):
+            return SCANNERS[scanner_name], False
+    if fname in LOCK_SCANNERS:
+        return LOCK_SCANNERS[fname], True
+    for scanner_name in LOCK_SCANNERS:
+        if fname.endswith(scanner_name):
+            return LOCK_SCANNERS[scanner_name], True
+    if re.match(r'requirements.*\.txt$', fname):
+        return parse_requirements, False
+    suffix = Path(fname).suffix.lower()
+    if suffix in EXTENSION_FALLBACKS:
+        return EXTENSION_FALLBACKS[suffix]
+    return None, False
+
+
+def _detect_by_content(fpath: Path):
+    try:
+        head = fpath.read_text(encoding="utf-8", errors="replace")[:256]
+    except Exception:
+        return None, False
+    if head.lstrip().startswith("{"):
+        return parse_package_json, False
+    if head.lstrip().startswith("<"):
+        return parse_pom_xml, False
+    if re.search(r'[A-Za-z][A-Za-z0-9._-]*\s*[><=!~]+\s*\S', head):
+        return parse_requirements, False
+    if head.lstrip().startswith("---") or head.lstrip().startswith("name:") or head.lstrip().startswith("version:"):
+        return parse_pyproject_toml, False
+    return None, False
+
+
 def scan_directory(root: Path, use_osv: bool = False) -> ScanResult:
     result = ScanResult()
     direct_deps = []
@@ -771,48 +972,32 @@ def scan_directory(root: Path, use_osv: bool = False) -> ScanResult:
 
     if root.is_file():
         fname = root.name
-        if fname in SCANNERS:
-            deps = SCANNERS[fname](root)
-            if deps:
-                direct_deps.extend(deps)
-                result.scanned_files.append(str(root))
-        elif fname in LOCK_SCANNERS:
-            deps = LOCK_SCANNERS[fname](root)
-            if deps:
+        scanner, is_lock = _resolve_scanner(fname)
+        if not scanner:
+            scanner, is_lock = _detect_by_content(root)
+        if scanner:
+            result.scanned_files.append(str(root))
+            deps = scanner(root)
+            if is_lock:
                 lock_deps.extend(deps)
-                result.scanned_files.append(str(root))
-        else:
-            deps = parse_requirements(root)
-            if deps:
+            else:
                 direct_deps.extend(deps)
-                result.scanned_files.append(str(root))
     else:
         for dirpath, dirnames, filenames in os.walk(root):
             dirnames[:] = [d for d in dirnames if not d.startswith(".") and d not in ("node_modules", "vendor", "venv", "__pycache__")]
 
             for fname in filenames:
                 fpath = Path(dirpath) / fname
-
-                # Direct dependency parsers
-                if fname in SCANNERS:
-                    deps = SCANNERS[fname](fpath)
-                    if deps:
-                        direct_deps.extend(deps)
-                        result.scanned_files.append(str(fpath))
-
-                # Lock file parsers (shadow deps)
-                if fname in LOCK_SCANNERS:
-                    deps = LOCK_SCANNERS[fname](fpath)
-                    if deps:
+                scanner, is_lock = _resolve_scanner(fname)
+                if not scanner:
+                    scanner, is_lock = _detect_by_content(fpath)
+                if scanner and str(fpath) not in result.scanned_files:
+                    result.scanned_files.append(str(fpath))
+                    deps = scanner(fpath)
+                    if is_lock:
                         lock_deps.extend(deps)
-                        result.scanned_files.append(str(fpath))
-
-                # Glob patterns
-                if re.match(r'requirements.*\.txt$', fname) and str(fpath) not in result.scanned_files:
-                    deps = parse_requirements(fpath)
-                    if deps:
+                    else:
                         direct_deps.extend(deps)
-                        result.scanned_files.append(str(fpath))
 
     # Enrich direct deps
     direct_deps = check_vulnerabilities(direct_deps)
@@ -949,15 +1134,19 @@ def format_text(result: ScanResult) -> str:
         lines.append("")
 
     # CVEs
-    cve_deps = [d for d in result.dependencies if d.cve_count > 0]
+    cve_deps = [d for d in result.dependencies if d.severity is not None or d.cve_count > 0]
     if cve_deps:
         total_cves = sum(d.cve_count for d in cve_deps)
-        lines.append(f"  {C.BOLD}{C.RED}CVE / VULNERABILITIES:{C.RESET} {_tag(f'{total_cves} CVEs', C.BG_RED)} across {len(cve_deps)} packages")
+        cve_label = f"{total_cves} CVEs" if total_cves else f"{len(cve_deps)} vulnerable"
+        lines.append(f"  {C.BOLD}{C.RED}CVE / VULNERABILITIES:{C.RESET} {_tag(cve_label, C.BG_RED)} across {len(cve_deps)} packages")
         lines.append(f"{C.RED}{'-' * 65}{C.RESET}")
         for d in cve_deps:
             sc = _sev_color(d.severity)
             lines.append(f"    {sc}[{d.severity.value.upper()}]{C.RESET} {C.BOLD}{d.name}{C.RESET} {d.version}")
-            lines.append(f"      {C.DIM}CVEs: {', '.join(d.cve_ids[:5])}{C.RESET}")
+            if d.cve_ids:
+                lines.append(f"      {C.DIM}CVEs: {', '.join(d.cve_ids[:5])}{C.RESET}")
+            elif d.note:
+                lines.append(f"      {C.DIM}{d.note}{C.RESET}")
         lines.append("")
 
     # Stale
@@ -1028,6 +1217,13 @@ def format_text(result: ScanResult) -> str:
     return "\n".join(lines)
 
 
+class _EnumEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, Enum):
+            return obj.value
+        return super().default(obj)
+
+
 def format_json(result: ScanResult) -> str:
     rs = result.risk_summary
     imp = result.impact
@@ -1048,6 +1244,7 @@ def format_json(result: ScanResult) -> str:
                 "total_dependencies": rs.total_dependencies,
                 "shadow_count": rs.shadow_count,
                 "stale_count": rs.stale_count,
+                "vulnerable_count": rs.vulnerable_count,
                 "critical_domain_count": rs.critical_domain_count,
                 "copyleft_count": rs.copyleft_count,
             },
@@ -1072,7 +1269,7 @@ def format_json(result: ScanResult) -> str:
                     "ecosystem": d.ecosystem,
                     "risk_score": d.risk_score,
                 }
-                for d in result.dependencies if d.cve_count > 0
+                for d in result.dependencies if d.severity is not None or d.cve_count > 0
             ],
             "stale": [
                 {"name": d.name, "version": d.version, "source": d.source_file, "ecosystem": d.ecosystem}
@@ -1100,10 +1297,10 @@ def format_json(result: ScanResult) -> str:
                 for d in result.dependencies if d.is_critical_domain
             ],
         },
-        "all_dependencies": [asdict(d) for d in result.dependencies],
+        "all_dependencies": [d.to_dict() for d in result.dependencies],
         "errors": result.errors,
     }
-    return json.dumps(output, indent=2, default=str)
+    return json.dumps(output, indent=2, cls=_EnumEncoder)
 
 
 def format_csv(result: ScanResult) -> str:
@@ -1122,7 +1319,7 @@ def format_html(result: ScanResult) -> str:
     risk_bg = {"critical": "#dc3545", "high": "#e8590c", "medium": "#f59f00", "low": "#2f9e44", "minimal": "#868e96"}
     sev_bg = {"critical": "#dc3545", "high": "#e8590c", "medium": "#f59f00", "low": "#2f9e44", "info": "#868e96"}
 
-    cve_deps = [d for d in result.dependencies if d.cve_count > 0]
+    cve_deps = [d for d in result.dependencies if d.severity is not None or d.cve_count > 0]
     stale_deps = [d for d in result.dependencies if d.is_stale]
     outdated_deps = [d for d in result.dependencies if d.is_outdated]
     shadow_deps = [d for d in result.dependencies if d.is_shadow]
@@ -1197,6 +1394,39 @@ def format_html(result: ScanResult) -> str:
                       padding: 1rem 1.5rem; border-radius: 0 8px 8px 0; margin: 1rem 0; }}
   .recommendations li {{ margin: 0.4rem 0; }}
   .section-empty {{ color: var(--text-dim); font-style: italic; padding: 1rem; }}
+  @media print {{
+    :root {{
+      --bg: #ffffff; --surface: #ffffff; --border: #cccccc;
+      --text: #000000; --text-dim: #555555; --accent: #0066cc;
+    }}
+    * {{ -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }}
+    body {{ background: #fff !important; color: #000 !important; padding: 1cm !important; min-height: auto !important; height: auto !important; }}
+    .risk-card {{ background: #fff !important; border: 1px solid #ccc !important; color: #000 !important; page-break-inside: avoid; }}
+    .risk-score {{ color: #000 !important; }}
+    .risk-level {{ color: #fff !important; }}
+    .bar-container {{ background: #eee !important; }}
+    .bar-fill {{ background: #666 !important; }}
+    .grid {{ page-break-inside: avoid; }}
+    .stat {{ background: #fff !important; border: 1px solid #ccc !important; color: #000 !important; }}
+    .stat-value {{ color: #000 !important; }}
+    .stat-label {{ color: #555 !important; }}
+    table {{ page-break-inside: avoid; }}
+    th {{ background: #f5f5f5 !important; color: #333 !important; border-bottom: 2px solid #ccc !important; }}
+    td {{ color: #000 !important; border-bottom: 1px solid #ddd !important; }}
+    .sev-badge {{ color: #fff !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }}
+    .badge {{ color: #fff !important; -webkit-print-color-adjust: exact !important; print-color-adjust: exact !important; }}
+    .badge-yellow {{ color: #000 !important; }}
+    .badge-purple {{ color: #000 !important; }}
+    .badge-green {{ color: #000 !important; }}
+    .recommendations {{ background: #fff !important; border-left: 3px solid #f59f00 !important; color: #000 !important; page-break-inside: avoid; }}
+    .recommendations li {{ color: #000 !important; }}
+    h1 {{ color: #0066cc !important; }}
+    h2 {{ color: #000 !important; border-bottom-color: #ccc !important; page-break-after: avoid; }}
+    h3 {{ color: #000 !important; }}
+    .meta {{ color: #555 !important; }}
+    code {{ background: #f5f5f5 !important; color: #000 !important; }}
+    .section-empty {{ display: none; }}
+  }}
 </style>
 </head>
 <body>
@@ -1239,23 +1469,17 @@ def format_html(result: ScanResult) -> str:
   </ul>
 </div>
 
-<h2>Vulnerabilities ({len(cve_deps)} packages)</h2>
-{"<table><tr><th>Package</th><th>Version</th><th>Severity</th><th>CVEs</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td><code>{d.version}</code></td><td><span class="sev-badge" style="background:{sev_bg.get(d.severity.value,"#868e96")}">{d.severity.value.upper()}</span></td><td>{", ".join(d.cve_ids[:5])}</td><td>{d.source_file}</td></tr>' for d in cve_deps) + "</table>" if cve_deps else '<p class="section-empty">No known vulnerabilities found.</p>'}
+{"<h2>Vulnerabilities (" + str(len(cve_deps)) + " packages)</h2><table><tr><th>Package</th><th>Version</th><th>Severity</th><th>CVEs</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td><code>{d.version}</code></td><td><span class="sev-badge" style="background:{sev_bg.get(d.severity.value,"#868e96")}">{d.severity.value.upper()}</span></td><td>{", ".join(d.cve_ids[:5])}</td><td>{d.source_file}</td></tr>' for d in cve_deps) + "</table>" if cve_deps else ""}
 
-<h2>Stale Packages ({len(stale_deps)})</h2>
-{"<table><tr><th>Package</th><th>Version</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td><code>{d.version}</code></td><td>{d.source_file}</td></tr>' for d in stale_deps) + "</table>" if stale_deps else '<p class="section-empty">No stale packages.</p>'}
+{"<h2>Stale Packages (" + str(len(stale_deps)) + ")</h2><table><tr><th>Package</th><th>Version</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td><code>{d.version}</code></td><td>{d.source_file}</td></tr>' for d in stale_deps) + "</table>" if stale_deps else ""}
 
-<h2>Outdated Packages ({len(outdated_deps)})</h2>
-{"<table><tr><th>Package</th><th>Current</th><th>Latest</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td><code>{d.version}</code></td><td><code style="color:var(--green)">{d.latest_version}</code></td><td>{d.source_file}</td></tr>' for d in outdated_deps) + "</table>" if outdated_deps else '<p class="section-empty">No outdated packages.</p>'}
+{"<h2>Outdated Packages (" + str(len(outdated_deps)) + ")</h2><table><tr><th>Package</th><th>Current</th><th>Latest</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td><code>{d.version}</code></td><td><code style="color:var(--green)">{d.latest_version}</code></td><td>{d.source_file}</td></tr>' for d in outdated_deps) + "</table>" if outdated_deps else ""}
 
-<h2>Shadow Dependencies ({len(shadow_deps)})</h2>
-{"<table><tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td><code>{d.version}</code></td><td>{d.ecosystem}</td><td>{d.source_file}</td></tr>' for d in shadow_deps[:50]) + (f'<tr><td colspan="4" style="color:var(--text-dim)">... and {len(shadow_deps) - 50} more</td></tr>' if len(shadow_deps) > 50 else '') + "</table>" if shadow_deps else '<p class="section-empty">No shadow dependencies detected.</p>'}
+{"<h2>Shadow Dependencies (" + str(len(shadow_deps)) + ")</h2><table><tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td><code>{d.version}</code></td><td>{d.ecosystem}</td><td>{d.source_file}</td></tr>' for d in shadow_deps[:50]) + (f'<tr><td colspan="4" style="color:var(--text-dim)">... and {len(shadow_deps) - 50} more</td></tr>' if len(shadow_deps) > 50 else '') + "</table>" if shadow_deps else ""}
 
-<h2>License Issues ({len(lic_issues)})</h2>
-{"<table><tr><th>Package</th><th>License</th><th>Type</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td>{d.license.name}</td><td><span class="badge {"badge-red" if d.license.is_copyleft else "badge-yellow"}">{"COPYLEFT" if d.license.is_copyleft else "UNKNOWN"}</span></td><td>{d.source_file}</td></tr>' for d in lic_issues) + "</table>" if lic_issues else '<p class="section-empty">No license issues.</p>'}
+{"<h2>License Issues (" + str(len(lic_issues)) + ")</h2><table><tr><th>Package</th><th>License</th><th>Type</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td>{d.license.name}</td><td><span class="badge {"badge-red" if d.license.is_copyleft else "badge-yellow"}">{"COPYLEFT" if d.license.is_copyleft else "UNKNOWN"}</span></td><td>{d.source_file}</td></tr>' for d in lic_issues) + "</table>" if lic_issues else ""}
 
-<h2>Critical Domain Dependencies ({len(crit_deps)})</h2>
-{"<table><tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td><code>{d.version}</code></td><td>{d.ecosystem}</td><td>{d.source_file}</td></tr>' for d in crit_deps) + "</table>" if crit_deps else '<p class="section-empty">No critical-domain packages.</p>'}
+{"<h2>Critical Domain Dependencies (" + str(len(crit_deps)) + ")</h2><table><tr><th>Package</th><th>Version</th><th>Ecosystem</th><th>Source</th></tr>" + "".join(f'<tr><td><strong>{d.name}</strong></td><td><code>{d.version}</code></td><td>{d.ecosystem}</td><td>{d.source_file}</td></tr>' for d in crit_deps) + "</table>" if crit_deps else ""}
 
 <h2>Impact Analysis</h2>
 <div class="grid">
@@ -1313,8 +1537,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     root = Path(args.path).resolve()
-    if not root.is_dir():
-        print(f"Error: '{root}' is not a directory", file=sys.stderr)
+    if not root.exists():
+        print(f"Error: '{root}' does not exist", file=sys.stderr)
+        return 2
+    if not root.is_dir() and not root.is_file():
+        print(f"Error: '{root}' is not a file or directory", file=sys.stderr)
         return 2
 
     # Color support
